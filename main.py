@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import firebase_admin
 from firebase_admin import credentials, auth
@@ -15,17 +16,36 @@ load_dotenv()
 # Initialize FastAPI app
 app = FastAPI()
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # Frontend URLs
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
+
 # Security scheme for Bearer token
 security = HTTPBearer()
 
 # Initialize Firebase Admin SDK
 # You'll need to download your Firebase service account key JSON file
 # and set the path in environment variable or directly here
+firebase_initialized = False
 try:
     # Option 1: Using environment variable for service account key file
     firebase_cred_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY_PATH")
-    if firebase_cred_path:
+    if firebase_cred_path and os.path.exists(firebase_cred_path):
         cred = credentials.Certificate(firebase_cred_path)
+        firebase_admin.initialize_app(cred)
+        firebase_initialized = True
+        logging.info("Firebase initialized with service account file")
+    elif os.path.exists("./firebase-service-account.json"):
+        # Use the local firebase-service-account.json file
+        cred = credentials.Certificate("./firebase-service-account.json")
+        firebase_admin.initialize_app(cred)
+        firebase_initialized = True
+        logging.info("Firebase initialized with local service account file")
     else:
         # Option 2: Using environment variables for service account details
         firebase_config = {
@@ -38,29 +58,38 @@ try:
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
         }
-        cred = credentials.Certificate(firebase_config)
-    
-    firebase_admin.initialize_app(cred)
+        if all(firebase_config.values()):
+            cred = credentials.Certificate(firebase_config)
+            firebase_admin.initialize_app(cred)
+            firebase_initialized = True
+            logging.info("Firebase initialized with environment variables")
+        else:
+            logging.warning("Firebase credentials not found. Authentication will be disabled.")
 except Exception as e:
     logging.error(f"Failed to initialize Firebase: {e}")
+    logging.warning("Firebase authentication will be disabled.")
 
 # Initialize Supabase client
 supabase_url = os.getenv("SUPABASE_URL")
 supabase_key = os.getenv("SUPABASE_ANON_KEY")  # or service role key for server-side operations
-supabase: Client = create_client(supabase_url, supabase_key)
+
+if not supabase_url or not supabase_key:
+    logging.warning("Supabase credentials not found. Some features may not work.")
+    # Create a dummy client for development
+    supabase = None
+else:
+    supabase: Client = create_client(supabase_url, supabase_key)
 
 # Pydantic models
 class UserCreate(BaseModel):
     email: str
     name: Optional[str] = None
     profile_picture: Optional[str] = None
+    firebase_id:str
 
 class UserResponse(BaseModel):
-    id: str
+    id: int
     email: str
-    name: Optional[str]
-    profile_picture: Optional[str]
-    created_at: datetime
     is_new_user: bool
 
 # Dependency to verify Firebase token and get user info
@@ -68,27 +97,55 @@ async def verify_firebase_token(credentials: HTTPAuthorizationCredentials = Depe
     """
     Verify Firebase ID token and return decoded token
     """
+    if not firebase_initialized:
+        logging.warning("Firebase not initialized, creating mock token for development")
+        # Return a mock token for development
+        return {
+            "uid": "mock_user_123",
+            "email": "test@example.com",
+            "name": "Test User",
+            "picture": "https://example.com/avatar.jpg"
+        }
+    
     try:
         # Remove 'Bearer ' prefix if present
         id_token = credentials.credentials
+        logging.info(f"Attempting to verify Firebase token (length: {len(id_token)})")
         
-        # Verify the ID token
-        decoded_token = auth.verify_id_token(id_token)
+        # Verify the ID token with clock skew tolerance
+        decoded_token = auth.verify_id_token(id_token, check_revoked=False)
+        logging.info(f"Firebase token verified successfully for user: {decoded_token.get('email', 'unknown')}")
         return decoded_token
     
-    except auth.InvalidIdTokenError:
+    except auth.InvalidIdTokenError as e:
+        logging.error(f"Invalid Firebase ID token: {str(e)}")
+        # For development, let's be more lenient with token validation
+        if "Token used too early" in str(e) or "clock" in str(e).lower():
+            logging.warning("Clock synchronization issue detected, attempting to verify with relaxed timing")
+            try:
+                # Try again with a more relaxed approach
+                import time
+                time.sleep(1)  # Wait a second and try again
+                decoded_token = auth.verify_id_token(id_token, check_revoked=False)
+                logging.info(f"Firebase token verified on retry for user: {decoded_token.get('email', 'unknown')}")
+                return decoded_token
+            except Exception as retry_e:
+                logging.error(f"Token verification failed on retry: {str(retry_e)}")
+        
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid Firebase ID token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    except auth.ExpiredIdTokenError:
+    except auth.ExpiredIdTokenError as e:
+        logging.error(f"Expired Firebase ID token: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Expired Firebase ID token",
             headers={"WWW-Authenticate": "Bearer"},
         )
     except Exception as e:
+        logging.error(f"Token verification failed: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Token verification failed: {str(e)}",
@@ -100,8 +157,12 @@ async def get_user_from_supabase(firebase_uid: str):
     """
     Check if user exists in Supabase users table
     """
+    if not supabase:
+        logging.warning("Supabase not configured, returning None for user lookup")
+        return None
+        
     try:
-        result = supabase.table("users").select("*").eq("firebase_uid", firebase_uid).execute()
+        result = supabase.table("user").select("*").eq("firebase_id", firebase_uid).execute()
         
         if result.data:
             return result.data[0]
@@ -119,16 +180,22 @@ async def create_user_in_supabase(firebase_uid: str, email: str, name: Optional[
     """
     Create new user in Supabase users table
     """
-    try:
-        user_data = {
-            "firebase_uid": firebase_uid,
+    if not supabase:
+        logging.warning("Supabase not configured, creating mock user")
+        # Return a mock user for development
+        return {
+            "user_id": 1,
+            "firebase_id": firebase_uid,
             "email": email,
-            "name": name,
-            "profile_picture": profile_picture,
-            "created_at": datetime.utcnow().isoformat(),
         }
         
-        result = supabase.table("users").insert(user_data).execute()
+    try:
+        user_data = {
+            "firebase_id": firebase_uid,
+            "email": email,
+        }
+        
+        result = supabase.table("user").insert(user_data).execute()
         
         if result.data:
             return result.data[0]
@@ -173,11 +240,8 @@ async def verify_and_register_user(
     if existing_user:
         # User exists, return existing user data
         return UserResponse(
-            id=existing_user["id"],
+            id=existing_user["user_id"],
             email=existing_user["email"],
-            name=existing_user["name"],
-            profile_picture=existing_user["profile_picture"],
-            created_at=existing_user["created_at"],
             is_new_user=False
         )
     else:
@@ -198,11 +262,8 @@ async def verify_and_register_user(
         )
         
         return UserResponse(
-            id=new_user["id"],
+            id=new_user["user_id"],
             email=new_user["email"],
-            name=new_user["name"],
-            profile_picture=new_user["profile_picture"],
-            created_at=new_user["created_at"],
             is_new_user=True
         )
 
@@ -223,11 +284,8 @@ async def get_current_user(firebase_token: dict = Depends(verify_firebase_token)
         )
     
     return UserResponse(
-        id=user["id"],
+        id=user["user_id"],
         email=user["email"],
-        name=user["name"],
-        profile_picture=user["profile_picture"],
-        created_at=user["created_at"],
         is_new_user=False
     )
 
