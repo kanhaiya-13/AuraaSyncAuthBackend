@@ -90,6 +90,15 @@ class UserCreate(BaseModel):
 class UserResponse(BaseModel):
     id: int
     email: str
+    name: Optional[str] = None
+    profile_picture: Optional[str] = None
+    gender: Optional[str] = None
+    location: Optional[str] = None
+    skin_tone: Optional[str] = None
+    face_shape: Optional[str] = None
+    body_shape: Optional[str] = None
+    personality: Optional[str] = None
+    onboarding_completed: Optional[bool] = None
     is_new_user: bool
 
 # Dependency to verify Firebase token and get user info
@@ -155,18 +164,31 @@ async def verify_firebase_token(credentials: HTTPAuthorizationCredentials = Depe
 # Function to check if user exists in Supabase
 async def get_user_from_supabase(firebase_uid: str):
     """
-    Check if user exists in Supabase users table
+    Check if user exists in Supabase users table and get customer data
     """
     if not supabase:
         logging.warning("Supabase not configured, returning None for user lookup")
         return None
         
     try:
-        result = supabase.table("user").select("*").eq("firebase_id", firebase_uid).execute()
+        # First, get the user record
+        user_result = supabase.table("user").select("*").eq("firebase_id", firebase_uid).execute()
         
-        if result.data:
-            return result.data[0]
-        return None
+        if not user_result.data:
+            return None
+        
+        user_record = user_result.data[0]
+        user_id = user_record["user_id"]
+        
+        # Then, get the customer record
+        customer_result = supabase.table("customer").select("*").eq("user_id", user_id).execute()
+        
+        if customer_result.data:
+            customer_record = customer_result.data[0]
+            # Merge user and customer data
+            user_record.update(customer_record)
+        
+        return user_record
     
     except Exception as e:
         logging.error(f"Error fetching user from Supabase: {e}")
@@ -178,7 +200,7 @@ async def get_user_from_supabase(firebase_uid: str):
 # Function to create new user in Supabase
 async def create_user_in_supabase(firebase_uid: str, email: str, name: Optional[str] = None, profile_picture: Optional[str] = None):
     """
-    Create new user in Supabase users table
+    Create new user in both user and customer tables in Supabase
     """
     if not supabase:
         logging.warning("Supabase not configured, creating mock user")
@@ -190,17 +212,48 @@ async def create_user_in_supabase(firebase_uid: str, email: str, name: Optional[
         }
         
     try:
+        # First, create the user record
         user_data = {
             "firebase_id": firebase_uid,
             "email": email,
+            "name": name,
         }
         
-        result = supabase.table("user").insert(user_data).execute()
+        user_result = supabase.table("user").insert(user_data).execute()
         
-        if result.data:
-            return result.data[0]
-        else:
-            raise Exception("Failed to create user")
+        if not user_result.data:
+            raise Exception("Failed to create user record")
+        
+        user_record = user_result.data[0]
+        user_id = user_record["user_id"]
+        
+        # Then, create the customer record
+        customer_data = {
+            "user_id": user_id,
+            "email": email,
+            "name": name or "",
+            "profile_picture": profile_picture or "",
+            "gender": "",
+            "location": "",
+            "skin_tone": "",
+            "face_shape": None,
+            "body_shape": None,
+            "personality": None,
+            "onboarding_completed": False,
+            "is_new_user": True
+        }
+        
+        customer_result = supabase.table("customer").insert(customer_data).execute()
+        
+        if not customer_result.data:
+            # If customer creation fails, we should clean up the user record
+            logging.error("Failed to create customer record, cleaning up user record")
+            supabase.table("user").delete().eq("user_id", user_id).execute()
+            raise Exception("Failed to create customer record")
+        
+        # Return the user record with additional info
+        user_record["customer_created"] = True
+        return user_record
     
     except Exception as e:
         logging.error(f"Error creating user in Supabase: {e}")
@@ -242,6 +295,15 @@ async def verify_and_register_user(
         return UserResponse(
             id=existing_user["user_id"],
             email=existing_user["email"],
+            name=existing_user.get("name"),
+            profile_picture=existing_user.get("profile_picture"),
+            gender=existing_user.get("gender"),
+            location=existing_user.get("location"),
+            skin_tone=existing_user.get("skin_tone"),
+            face_shape=existing_user.get("face_shape"),
+            body_shape=existing_user.get("body_shape"),
+            personality=existing_user.get("personality"),
+            onboarding_completed=existing_user.get("onboarding_completed"),
             is_new_user=False
         )
     else:
@@ -264,6 +326,15 @@ async def verify_and_register_user(
         return UserResponse(
             id=new_user["user_id"],
             email=new_user["email"],
+            name=new_user.get("name"),
+            profile_picture=new_user.get("profile_picture"),
+            gender=new_user.get("gender"),
+            location=new_user.get("location"),
+            skin_tone=new_user.get("skin_tone"),
+            face_shape=new_user.get("face_shape"),
+            body_shape=new_user.get("body_shape"),
+            personality=new_user.get("personality"),
+            onboarding_completed=new_user.get("onboarding_completed"),
             is_new_user=True
         )
 
@@ -286,6 +357,15 @@ async def get_current_user(firebase_token: dict = Depends(verify_firebase_token)
     return UserResponse(
         id=user["user_id"],
         email=user["email"],
+        name=user.get("name"),
+        profile_picture=user.get("profile_picture"),
+        gender=user.get("gender"),
+        location=user.get("location"),
+        skin_tone=user.get("skin_tone"),
+        face_shape=user.get("face_shape"),
+        body_shape=user.get("body_shape"),
+        personality=user.get("personality"),
+        onboarding_completed=user.get("onboarding_completed"),
         is_new_user=False
     )
 
