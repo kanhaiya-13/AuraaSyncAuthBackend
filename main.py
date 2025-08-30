@@ -374,6 +374,99 @@ async def get_current_user(firebase_token: dict = Depends(verify_firebase_token)
 async def health_check():
     return {"status": "healthy", "message": "FastAPI server is running"}
 
+# Route to update onboarding status
+@app.put("/auth/update-onboarding")
+async def update_onboarding_status(
+    onboarding_data: dict,
+    firebase_token: dict = Depends(verify_firebase_token)
+):
+    """
+    Update user's onboarding status and profile information
+    """
+    firebase_uid = firebase_token["uid"]
+    
+    try:
+        # Get user from database
+        user = await get_user_from_supabase(firebase_uid)
+        
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found in database"
+            )
+        
+        user_id = user["user_id"]
+        
+        # Check if customer record exists
+        if not supabase:
+            logging.warning("Supabase not configured, skipping customer update")
+            return {"message": "Onboarding status updated successfully (mock)"}
+        
+        # Verify customer record exists
+        customer_check = supabase.table("customer").select("*").eq("user_id", user_id).execute()
+        if not customer_check.data:
+            logging.error(f"No customer record found for user_id: {user_id}")
+            # Create customer record if it doesn't exist
+            customer_data = {
+                "user_id": user_id,
+                "email": user.get("email", ""),
+                "name": user.get("name", ""),
+                "profile_picture": user.get("profile_picture", ""),
+                "gender": "",
+                "location": "",
+                "skin_tone": "",
+                "face_shape": None,
+                "body_shape": None,
+                "personality": None,
+                "onboarding_completed": False,
+                "is_new_user": True
+            }
+            supabase.table("customer").insert(customer_data).execute()
+            logging.info(f"Created missing customer record for user_id: {user_id}")
+        
+        # Update customer table with onboarding data
+        update_data = {
+            "onboarding_completed": onboarding_data.get("onboarding_completed", False),
+            "gender": onboarding_data.get("gender", ""),
+            "name": onboarding_data.get("name", ""),
+            "skin_tone": onboarding_data.get("skin_tone", ""),
+            "face_shape": onboarding_data.get("face_shape"),
+            "body_shape": onboarding_data.get("body_shape"),
+            "personality": onboarding_data.get("personality")
+        }
+        
+        # Remove None values
+        update_data = {k: v for k, v in update_data.items() if v is not None}
+        
+        if supabase:
+            logging.info(f"Attempting to update customer table with data: {update_data}")
+            result = supabase.table("customer").update(update_data).eq("user_id", user_id).execute()
+            
+            logging.info(f"Update result: {result}")
+            
+            if result.data:
+                logging.info(f"Successfully updated customer record for user_id: {user_id}")
+                return {"message": "Onboarding status updated successfully"}
+            else:
+                logging.error(f"No data returned from update operation for user_id: {user_id}")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to update onboarding status - no data returned"
+                )
+        else:
+            # Mock response for development
+            return {"message": "Onboarding status updated successfully (mock)"}
+    
+    except Exception as e:
+        logging.error(f"Error updating onboarding status: {e}")
+        logging.error(f"Firebase UID: {firebase_uid}")
+        logging.error(f"User data: {user}")
+        logging.error(f"Update data: {update_data}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update onboarding status: {str(e)}"
+        )
+
 # Example of a protected route that requires authentication
 @app.get("/protected")
 async def protected_route(firebase_token: dict = Depends(verify_firebase_token)):
